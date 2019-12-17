@@ -14,77 +14,6 @@
  * limitations under the License.
  */
 
-/*
- *
- *
- *
- *
- * State Transition
- * ================
- * 
- * Structs
- * -------
- * Thread:    active_p, ready_q, wait_q, wait_q_l, poll_q, create_q_l, awake_a ...
- * Coroutine: state_n, awake_n, tmout_i, condvar ...
- * Lock:      awake_q ...
- * CondVar:   awake_q ...
- * 
- * (_p):      pointer
- * (_q):      queue
- * (_n):      queue_item
- * (_l):      lock
- * (_i):      int
- * (_a):      atomic int
- * 
- * 
- * Transition
- * ----------
- * Create:
- * + Creator:   push to create_q with create_q_l
- * + Scheduler: pop from create_q with create_q_l, push back to ready_q
- * 
- * Exec:
- * + Scheduler: pop front from ready_q, to active_p, exec till:
- *              yield / sleep / lock / cond wait / poll / return
- * 
- * Yield:
- * + Coroutine: active_p NULL, push back to ready_q
- * 
- * Sleep:
- * + Coroutine: active_p NULL, set tmout_i,
- *              hold wait_q_l, push back wait_q
- * + Scheduler: goto CondWait Scheduler
- * 
- * 
- * Lock:
- * + Coroutine: active_p NULL, tmout_i inf,
- *              hold wait_q_l, push back wait_q
- * + Unlocker:  pop from awake_q,
- *              hold wait_q_l, tmout_i 0, move to wait_q front,
- *              inc awake_a,
- *              yield if wakes a waiter in local thread
- * + Scheduler: goto CondWait Scheduler
- * 
- * CondWait:
- * + Coroutine: active_p NULL,
- *              hold wait_q_l, set tmout, push back wait_q,
- *              push back awake_q
- * + Waker:     pop front from awake_q,
- *              hold wait_q_l, tmout_i 0, move to front, condvar NULL
- * + Scheduler: on full tmout scan, handle tmout items,
- *              set item tmout_i 0 and move to front with wait_q_l,
- *              on awake_a > 0, scan tmout_i 0 in wait_q front,
- *              pop tmout_i 0 items from wait_q,
- *              cond wait handled by waker, condvar NULL,
- *              cond wait handled by scheduler, has condvar, NULL it later,
- *              pop from condvar awake_q, waker may did this,
- *              all items push back to ready_q
- *              
- * Adapt to native thread:
- * + Use cond wait to simulate lock blocking.
- * + In cond wait, use the lock in cond var to sync signal and wait.
- */
-
 
 #include <stdlib.h>
 #include <ctype.h>
@@ -224,7 +153,9 @@ struct WINCO_THRD_T {
     WINCO_Q ready_q;
 
     WINCO_Q wait_q;
-    CRITICAL_SECTION wait_q_l;
+
+    WINCO_Q awake_q;
+    CRITICAL_SECTION awake_q_l;
     int awake_signal;
 
     WINCO_Q wsapoll_q;
@@ -321,11 +252,12 @@ uint64_t g_last_stat = 0;
 
 
 int winco_init() {
-    // Call once for a process.
+    // Once.
     if (1 == InterlockedCompareExchange(&g_init_flag, 1, 0)) {
         return 1;
     }
 
+    // Thrd N.
     int thrd_n = (int)g_thrd_cnt_override;
     if (thrd_n == 0) {
         SYSTEM_INFO sys_inf;
@@ -341,6 +273,7 @@ int winco_init() {
     assert(g_metric);
     g_last_stat = winco_tick_ms();
 
+    // Thrds.
     g_thrd_n = thrd_n;
     g_thrds = (WINCO_THRD*)calloc(thrd_n, sizeof(WINCO_THRD));
 
@@ -356,7 +289,8 @@ int winco_init() {
         th->active_rt = NULL;
         winco_q_init(&th->ready_q);
         winco_q_init(&th->wait_q);
-        InitializeCriticalSection(&th->wait_q_l);
+        winco_q_init(&th->awake_q);
+        InitializeCriticalSection(&th->awake_q_l);
         th->awake_signal = 0;
         winco_q_init(&th->wsapoll_q);
         th->wsapoll_fdn = 128;
@@ -385,7 +319,8 @@ int winco_destroy() {
             assert(th->active_rt == NULL);
             assert(th->ready_q.len == 0);
             assert(th->wait_q.len == 0);
-            DeleteCriticalSection(&th->wait_q_l);
+            assert(th->awake_q.len == 0);
+            DeleteCriticalSection(&th->awake_q_l);
             assert(th->wsapoll_q.len == 0);
             if (th->wsapoll_fds) free(th->wsapoll_fds);
             assert(th->create_q.len == 0);
@@ -415,16 +350,17 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
     while (InterlockedExchangeAdd(&th->id, 0)) {
         /* Schedule. */
         int handle_create_exit_q_type = 0;  // 0: ignore, 1: handle.
-        int handle_wait_q_type = 0;  // 0: ignore, 1: wake, 2: tmout scan.
+        int handle_wait_q_type = 0;  // 0: ignore, 1: scan.
+        int handle_awake_q_type = 0;  // 0: ignore, 1: wake.
         int handle_poll_q_type = 0;  // 0: ignore, 1: poll.
         uint64_t now = winco_tick_ms();
         if (now - last_create_exit > 333) {
             handle_create_exit_q_type = 1;
         }
-        if (now - last_tmout_scan > g_rt_wait_tmout) {
-            handle_wait_q_type = 2;
+        if (InterlockedExchangeAdd(&th->awake_signal, 0) > 0) {
+            handle_awake_q_type = 1;
         }
-        else if (InterlockedExchange(&th->awake_signal, 0) > 0) {
+        if (now - last_tmout_scan > g_rt_wait_tmout) {
             handle_wait_q_type = 1;
         }
         if (now - last_poll > g_wsapoll_intv) {
@@ -465,38 +401,51 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
             last_create_exit = winco_tick_ms();
         }
 
+        /* Handle awake queue. */
+        if (handle_awake_q_type > 0) {
+            WINCO_Q awake_q;
+            winco_q_init(&awake_q);
+
+            // Try lock. Avoid contention.
+            if (TryEnterCriticalSection(&th->awake_q_l)) {
+                InterlockedExchange(&th->awake_signal, 0);
+                winco_q_assign(&th->awake_q, &awake_q);
+                LeaveCriticalSection(&th->awake_q_l);
+            }
+
+            while (awake_q.len > 0)
+            {
+                WINCO_ROUTINE* rt = winco_q_owner(
+                    winco_q_popfront(&awake_q), WINCO_ROUTINE, awake_node);
+                // If still in wait q.
+                if (winco_q_inqueue(&rt->state_node)) {
+                    winco_q_detach(&th->wait_q, &rt->state_node);
+                }
+                winco_q_pushback(&th->ready_q, &rt->state_node);
+            }
+        }
+
         /* Handle wait queue. */
         if (handle_wait_q_type > 0) {
             WINCO_Q waken_q;
             winco_q_init(&waken_q);
 
-            EnterCriticalSection(&th->wait_q_l);
             WINCO_Q* prev = NULL, * curr = NULL;
             while (curr = winco_q_iternext(&th->wait_q, prev))
             {
                 WINCO_ROUTINE* rt = winco_q_owner(
                     curr, WINCO_ROUTINE, state_node);
-                if (rt->tmout == 0) {
+                // Wakeup & tmout may both happen, CAS tmout->0 to elect owner.
+                uint64_t tmout = InterlockedExchangeAdd64(&rt->tmout, 0);
+                if (tmout < now && tmout != 0 && InterlockedCompareExchange64(
+                    &rt->tmout, 0, tmout) == tmout) {
                     winco_q_detach(&th->wait_q, &rt->state_node);
                     winco_q_pushback(&waken_q, &rt->state_node);
                 }
                 else {
-                    if (handle_wait_q_type == 1) {
-                        break;
-                    }
-                    else {
-                        if (rt->tmout < now) {
-                            rt->tmout = 0;
-                            winco_q_detach(&th->wait_q, &rt->state_node);
-                            winco_q_pushback(&waken_q, &rt->state_node);
-                        }
-                        else {
-                            prev = curr;
-                        }
-                    }
+                    prev = curr;
                 }
             }
-            LeaveCriticalSection(&th->wait_q_l);
 
             while (waken_q.len > 0) {
                 WINCO_ROUTINE* rt = winco_q_owner(
@@ -506,6 +455,7 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
                     rt->condvar = NULL;
                     rt->condvar_err = 1;
                     EnterCriticalSection(&condvar->lk);
+                    // May be removed by waker.
                     if (winco_q_inqueue(&rt->awake_node)) {
                         winco_q_detach(&condvar->awake_q, &rt->awake_node);
                     }
@@ -514,9 +464,7 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
                 winco_q_pushback(&th->ready_q, &rt->state_node);
             }
 
-            if (handle_wait_q_type == 2) {
-                last_tmout_scan = winco_tick_ms();
-            }
+            last_tmout_scan = winco_tick_ms();
         }
 
         /* Handle poll. */
@@ -671,6 +619,7 @@ void winco_yield() {
         return;
     }
 
+    // To ready q, will re-sched.
     WINCO_THRD* th = g_thrd;
     WINCO_ROUTINE* rt = g_thrd->active_rt;
     winco_q_pushback(&th->ready_q, &rt->state_node);
@@ -686,13 +635,12 @@ void winco_sleep(uint64_t ms) {
         return;
     }
 
+    // To wait q with tmout, will wake up and re-sched.
     if (ms <= 0) return;
     WINCO_THRD* th = g_thrd;
     WINCO_ROUTINE* rt = g_thrd->active_rt;
     rt->tmout = winco_tick_ms() + ms;
-    EnterCriticalSection(&th->wait_q_l);
     winco_q_pushback(&th->wait_q, &rt->state_node);
-    LeaveCriticalSection(&th->wait_q_l);
 
     SwitchToFiber(th->sched_rt);
 }
@@ -722,31 +670,30 @@ void winco_lock0(WINCO_LOCK *lk, int mode) {
 
     EnterCriticalSection(&lk->lk);
     while (redo) {
+        // Exclusive.
         if (mode == WINCO_EXL_LOCK && lk->n == WINCO_MAX_LOCK_CNT) {
             lk->n = WINCO_EXL_LOCK_CNT;
             redo = 0;
         }
+        // Shared.
         else if (mode == WINCO_SHR_LOCK && lk->n > WINCO_EXL_LOCK_CNT) {
             lk->n--;
             redo = 0;
         }
         else {
+            // Thread. Go idle with cond wait.
             if (rt_id == -1) {
                 lk->wait_th_n++;
                 SleepConditionVariableCS(&lk->cond_var, 
                     &lk->lk, INFINITE);
                 lk->wait_th_n--;
             }
+            // Coroutine. Go idle & wait for wakeup.
             else {
                 WINCO_THRD* th = g_thrd;
                 WINCO_ROUTINE* rt = th->active_rt;
                 assert(rt);
-                rt->tmout = UINT64_MAX;
                 winco_q_pushback(&lk->awake_q, &rt->awake_node);
-
-                EnterCriticalSection(&th->wait_q_l);
-                winco_q_pushback(&th->wait_q, &rt->state_node);
-                LeaveCriticalSection(&th->wait_q_l);
 
                 LeaveCriticalSection(&lk->lk);
                 SwitchToFiber(g_thrd->sched_rt);
@@ -773,26 +720,28 @@ void winco_unlock(WINCO_LOCK* lk) {
 
     EnterCriticalSection(&lk->lk);
     assert(lk->n < WINCO_MAX_LOCK_CNT);
+    // Exclusive.
     if (lk->n == WINCO_EXL_LOCK_CNT) {
         lk->n = WINCO_MAX_LOCK_CNT;
     }
+    // Shared.
     else {
         lk->n++;
     }
     
+    // Coroutine. To awake q & signal.
     if (lk->awake_q.len > 0) {
         WINCO_ROUTINE* rt = winco_q_owner(
             winco_q_popfront(&lk->awake_q), 
             WINCO_ROUTINE, awake_node);
         WINCO_THRD* th = rt->thrd;
 
-        EnterCriticalSection(&th->wait_q_l);
-        rt->tmout = 0;
-        winco_q_detach(&th->wait_q, &rt->state_node);
-        winco_q_pushfront(&th->wait_q, &rt->state_node);
+        EnterCriticalSection(&th->awake_q_l);
+        winco_q_pushback(&th->awake_q, &rt->awake_node);
+        LeaveCriticalSection(&th->awake_q_l);
         InterlockedAdd(&th->awake_signal, 1);
-        LeaveCriticalSection(&th->wait_q_l);
     }
+    // Thread. Signal.
     else if (lk->wait_th_n > 0) {
         WakeConditionVariable(&lk->cond_var);
     }
@@ -826,14 +775,13 @@ int winco_cond_wait(WINCO_COND_VAR* cond, WINCO_LOCK* lk, uint64_t wait_ms) {
 
     InterlockedIncrement64(&g_metric->cond_w_n);
 
+    // Coroutine. Wait in wait q with tmout + wait in awake q.
     if (th) {
         WINCO_ROUTINE* rt = th->active_rt;
-        rt->tmout = winco_tick_ms() + wait_ms;
+        InterlockedExchange64(&rt->tmout, winco_tick_ms() + wait_ms);
         rt->condvar = cond;
         rt->condvar_err = 0;
-        EnterCriticalSection(&th->wait_q_l);
         winco_q_pushback(&th->wait_q, &rt->state_node);
-        LeaveCriticalSection(&th->wait_q_l);
 
         EnterCriticalSection(&cond->lk);
         winco_q_pushback(&cond->awake_q, &rt->awake_node);
@@ -844,6 +792,7 @@ int winco_cond_wait(WINCO_COND_VAR* cond, WINCO_LOCK* lk, uint64_t wait_ms) {
         winco_lock(lk);
         r = rt->condvar_err;
     }
+    // Thread. Wait on cond var.
     else {
         EnterCriticalSection(&cond->lk);
         winco_unlock(lk);
@@ -852,7 +801,8 @@ int winco_cond_wait(WINCO_COND_VAR* cond, WINCO_LOCK* lk, uint64_t wait_ms) {
             &cond->cond_var, &cond->lk, (DWORD)wait_ms) == 0) ? 1 : 0;
         cond->wait_th_n--;
         LeaveCriticalSection(&cond->lk);
-        winco_lock(lk);  // Hold after cond->lk so no dead lock.
+        // Waker locks lk then cond->lk, so unlock cond->lk first.
+        winco_lock(lk);
     }
 
     if (r == 0) {
@@ -868,26 +818,29 @@ int winco_cond_wait(WINCO_COND_VAR* cond, WINCO_LOCK* lk, uint64_t wait_ms) {
 void winco_cond_signal(WINCO_COND_VAR* cond) {
     WINCO_ROUTINE* rt = NULL;
     EnterCriticalSection(&cond->lk);
+    // Wake up 1 coroutine.
     if (cond->awake_q.len > 0) {
         rt = winco_q_owner(winco_q_popfront(&cond->awake_q),
             WINCO_ROUTINE, awake_node);
     }
+    // Wake up 1 thread.
     else if (cond->wait_th_n > 0) {
         WakeConditionVariable(&cond->cond_var);
     }
     LeaveCriticalSection(&cond->lk);
 
     if (rt) {
+        // To awake q & signal.
         WINCO_THRD* th = rt->thrd;
-        EnterCriticalSection(&th->wait_q_l);
-        if (rt->tmout > 0) {
-            rt->tmout = 0;
+        // Wakeup & tmout may both happen, CAS tmout->0 to elect owner.
+        uint64_t tmout = InterlockedExchangeAdd64(&rt->tmout, 0);
+        if (InterlockedCompareExchange64(&rt->tmout, 0, tmout) == tmout) {
             rt->condvar = NULL;
-            winco_q_detach(&th->wait_q, &rt->state_node);
-            winco_q_pushfront(&th->wait_q, &rt->state_node);
+            EnterCriticalSection(&th->awake_q_l);
+            winco_q_pushback(&th->awake_q, &rt->awake_node);
+            LeaveCriticalSection(&th->awake_q_l);
             InterlockedAdd(&th->awake_signal, 1);
         }
-        LeaveCriticalSection(&th->wait_q_l);
     }
 
     InterlockedIncrement64(&g_metric->cond_s_n);
@@ -897,9 +850,11 @@ void winco_cond_signal_all(WINCO_COND_VAR* cond) {
     WINCO_Q awake_q;
     winco_q_init(&awake_q);
     EnterCriticalSection(&cond->lk);
+    // Wake up all coroutines.
     if (cond->awake_q.len > 0) {
         winco_q_assign(&cond->awake_q, &awake_q);
     }
+    // Wake up all threads.
     if (cond->wait_th_n > 0)
     {
         WakeAllConditionVariable(&cond->cond_var);
@@ -909,16 +864,17 @@ void winco_cond_signal_all(WINCO_COND_VAR* cond) {
     while (awake_q.len > 0) {
         WINCO_ROUTINE* rt = winco_q_owner(
             winco_q_popfront(&awake_q), WINCO_ROUTINE, awake_node);
+        // To awake q & signal.
         WINCO_THRD* th = rt->thrd;
-        EnterCriticalSection(&th->wait_q_l);
-        if (rt->tmout > 0) {
-            rt->tmout = 0;
+        // Wakeup & tmout may both happen, CAS tmout->0 to elect owner.
+        uint64_t tmout = InterlockedExchangeAdd64(&rt->tmout, 0);
+        if (InterlockedCompareExchange64(&rt->tmout, 0, tmout) == tmout) {
             rt->condvar = NULL;
-            winco_q_detach(&th->wait_q, &rt->state_node);
-            winco_q_pushfront(&th->wait_q, &rt->state_node);
+            EnterCriticalSection(&th->awake_q_l);
+            winco_q_pushback(&th->awake_q, &rt->awake_node);
+            LeaveCriticalSection(&th->awake_q_l);
             InterlockedAdd(&th->awake_signal, 1);
         }
-        LeaveCriticalSection(&th->wait_q_l);
     }
 
     InterlockedIncrement64(&g_metric->cond_s_n);
