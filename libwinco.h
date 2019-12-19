@@ -88,24 +88,44 @@ int winco_rt_routine_id(WINCO_ROUTINE* rt);
 
 /* Stats. */
 typedef struct WINCO_STATS_T {
-    int64_t thread_n;
-    int64_t coroutine_n;
-    double ctx_switch_per_sec;
-    double proc_t_ms_per_sec;
-    double idle_t_ms_per_sec;
-    double sleep_per_sec;
-    double yield_per_sec;
-    double lock_per_sec;
-    double lock_fail_per_sec;
-    double unlock_per_sec;
-    double cond_wait_per_sec;
-    double cond_signal_per_sec;
-    double cond_tmdout_per_sec;
-    double cond_signaled_per_sec;
-    double wsapoll_per_sec;
-    double wsapoll_succ_per_sec;
-    double wsapoll_tmdout_per_sec;
-    double wsapoll_cost_per_sec;
+    double thread_n;
+    double coroutine_n;
+
+    /* Context switch per sec. */
+    double ctx_s;
+    double ctx_s_yield;
+    double ctx_s_sleep;
+    double ctx_s_lock;
+    double ctx_s_cndw;
+    double ctx_s_poll;
+
+    /* Thread exec time in ms per clock sec. */
+    double exec_t;
+    double idle_t;
+    double poll_t;
+    double wake_t;
+    double wscn_t;
+
+    /* Inner queue length. */
+    double lock_q_len;
+    double cndw_q_len;
+    double wake_q_len;
+    double wait_q_len;
+    double poll_q_len;
+
+    /* Ops per sec. */
+    double sleep;
+    double yield;
+    double lock;
+    double lblk;
+    double unlk;
+    double cndw;
+    double cndw_sig;
+    double cndw_tmout;
+    double cndw_wake;
+    double poll;
+    double poll_event;
+    double poll_tmout;
 } WINCO_STATS;
 
 /* Get stats since last call. */

@@ -46,11 +46,19 @@ VOID __stdcall winco_rt_main(LPVOID arg);
 #define WINCO_LOG2(fmt, ...) \
     do { fprintf(stderr, fmt"\n", __VA_ARGS__); } while (0)
 
+/* Atomic. */
+#define ILEXC64(v, v1) InterlockedExchange64(v, v1)
+#define ILGET64(v) InterlockedExchangeAdd64(v, 0)
+#define ILSET64(v, v1) do { ILEXC64(v, v1); } while(0)
+#define ILINC64(v) do { InterlockedIncrement64(v); } while(0)
+#define ILDEC64(v) do { InterlockedDecrement64(v); } while(0)
+#define ILADD64(v, v1) do { InterlockedAdd64(v, v1); } while(0)
+
 /* Queue. */
 struct WINCO_Q_T {
     WINCO_Q* prev;
     WINCO_Q* next;
-    int      len;
+    int64_t  len;
 };
 
 void winco_q_init(WINCO_Q* q) {
@@ -236,24 +244,39 @@ struct WINCO_COND_VAR_T {
 
 /* Metrics. */
 struct METRIC_T {
-    int64_t thread_n;
-    int64_t coroutine_n;
-    int64_t ctx_switch_n;
-    int64_t proc_time_us;
-    int64_t idle_time_us;
+    int64_t thrd_n;
+    int64_t cort_n;
+    int64_t ctx_s_n;
+    int64_t ctx_s_yl_n;
+    int64_t ctx_s_sl_n;
+    int64_t ctx_s_lk_n;
+    int64_t ctx_s_cw_n;
+    int64_t ctx_s_pl_n;
+    int64_t exec_t;
+    int64_t idle_t;
+    int64_t wake_t;
+    int64_t wscn_t;
+    int64_t poll_t;
+    int64_t lock_q;
+    int64_t cndw_q;
+    int64_t wake_q;
+    int64_t wake_q_spn;
+    int64_t wait_q;
+    int64_t wait_q_spn;
+    int64_t wsapoll_q;
+    int64_t wsapoll_q_spn;
     int64_t yield_n;
     int64_t sleep_n;
     int64_t lock_n;
-    int64_t lock_fail_n;
+    int64_t lock_block_n;
     int64_t unlock_n;
     int64_t cond_w_n;
     int64_t cond_s_n;
-    int64_t cond_sd_n;
+    int64_t cond_wk_n;
     int64_t cond_to_n;
     int64_t wsapoll_n;
-    int64_t wsapoll_succ_n;
+    int64_t wsapoll_event_n;
     int64_t wsapoll_to_n;
-    int64_t wsapoll_cost_us;
 };
 
 
@@ -281,7 +304,7 @@ WINCO* winco_init(int thrd_n) {
     w->thrd_n = thrd_n;
     w->thrds = (WINCO_THRD*)calloc(thrd_n, sizeof(WINCO_THRD));
 
-    InterlockedExchange64(&w->metric->thread_n, thrd_n);
+    ILEXC64(&w->metric->thrd_n, thrd_n);
 
     for (int it = 0; it < w->thrd_n; it++) {
         WINCO_THRD* th = w->thrds + it;
@@ -379,7 +402,7 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
             uint64_t t0 = winco_tick_us();
             Sleep((DWORD)th->w->thrd_idle_tmout);
             uint64_t t1 = winco_tick_us();
-            InterlockedAdd64(&th->w->metric->idle_time_us, t1 - t0);
+            InterlockedAdd64(&th->w->metric->idle_t, t1 - t0);
         }
 
         /* Handle create / exit rt. */
@@ -391,7 +414,7 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
                     WINCO_ROUTINE, state_node);
                 winco_q_pushback(&th->ready_q, &rt->state_node);
 
-                InterlockedIncrement64(&th->w->metric->coroutine_n);
+                ILINC64(&th->w->metric->cort_n);
             }
             LeaveCriticalSection(&th->create_q_l);
 
@@ -410,6 +433,7 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
 
         /* Handle awake queue. */
         if (handle_awake_q_type > 0) {
+            uint64_t t0 = winco_tick_us();
             WINCO_Q awake_q;
             winco_q_init(&awake_q);
 
@@ -420,6 +444,8 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
                 LeaveCriticalSection(&th->awake_q_l);
             }
 
+            ILADD64(&th->w->metric->wake_q, awake_q.len);
+            ILINC64(&th->w->metric->wake_q_spn);
             while (awake_q.len > 0)
             {
                 WINCO_ROUTINE* rt = winco_q_owner(
@@ -430,12 +456,18 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
                 }
                 winco_q_pushback(&th->ready_q, &rt->state_node);
             }
+            uint64_t t1 = winco_tick_us();
+            InterlockedAdd64(&th->w->metric->wake_t, t1 - t0);
         }
 
         /* Handle wait queue. */
         if (handle_wait_q_type > 0) {
+            uint64_t t0 = winco_tick_us();
             WINCO_Q waken_q;
             winco_q_init(&waken_q);
+
+            ILADD64(&th->w->metric->wait_q, th->wait_q.len);
+            ILINC64(&th->w->metric->wait_q_spn);
 
             WINCO_Q* prev = NULL, * curr = NULL;
             while (curr = winco_q_iternext(&th->wait_q, prev))
@@ -443,7 +475,7 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
                 WINCO_ROUTINE* rt = winco_q_owner(
                     curr, WINCO_ROUTINE, state_node);
                 // Wakeup & tmout may both happen, CAS tmout->0 to elect owner.
-                uint64_t tmout = InterlockedExchangeAdd64(&rt->tmout, 0);
+                uint64_t tmout = ILGET64(&rt->tmout);
                 if (tmout < now && tmout != 0 && InterlockedCompareExchange64(
                     &rt->tmout, 0, tmout) == tmout) {
                     winco_q_detach(&th->wait_q, &rt->state_node);
@@ -472,10 +504,16 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
             }
 
             last_tmout_scan = winco_tick_ms();
+            uint64_t t1 = winco_tick_us();
+            InterlockedAdd64(&th->w->metric->wscn_t, t1 - t0);
         }
 
         /* Handle poll. */
         if (handle_poll_q_type > 0) {
+            ILADD64(&th->w->metric->wsapoll_q, th->wsapoll_q.len);
+            ILINC64(&th->w->metric->wsapoll_q_spn);
+
+            uint64_t t0 = winco_tick_us();
             if (th->wsapoll_q.len > 0) {
                 LPWSAPOLLFD fds = th->wsapoll_fds;
                 INT fdn = 0;
@@ -506,10 +544,7 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
                     prev = curr;
                 }
 
-                uint64_t t0 = winco_tick_us();
                 int err = WSAPoll(fds, fdn, tmout);
-                uint64_t t1 = winco_tick_us();
-                InterlockedAdd64(&th->w->metric->wsapoll_cost_us, t1 - t0);
 
                 int fdpos = 0;
                 prev = curr = NULL;
@@ -537,23 +572,24 @@ static DWORD WINAPI winco_thrd_loop(LPVOID arg) {
             }
 
             last_poll = winco_tick_ms();
+            uint64_t t1 = winco_tick_us();
+            InterlockedAdd64(&th->w->metric->poll_t, t1 - t0);
         }
 
         /* Exec. */
         if (th->ready_q.len > 0)
         {
+            uint64_t t0 = winco_tick_us();
             WINCO_ROUTINE* active = winco_q_owner(
                 winco_q_popfront(&th->ready_q), WINCO_ROUTINE, state_node);
-
-            InterlockedIncrement64(&th->w->metric->ctx_switch_n);
-            uint64_t t0 = winco_tick_us();
 
             th->active_rt = active;
             SwitchToFiber(active->fiber);
             th->active_rt = NULL;
+            ILINC64(&th->w->metric->ctx_s_n);
 
             uint64_t t1 = winco_tick_us();
-            InterlockedAdd64(&th->w->metric->proc_time_us, t1 - t0);
+            InterlockedAdd64(&th->w->metric->exec_t, t1 - t0);
         }
     }
 
@@ -609,7 +645,7 @@ void* winco_join(WINCO_ROUTINE* rt) {
     }
     LeaveCriticalSection(&rt->fn_lk);
 
-    InterlockedDecrement64(&rt->thrd->w->metric->coroutine_n);
+    InterlockedDecrement64(&rt->thrd->w->metric->cort_n);
 
     return rt->fn_ret;
 }
@@ -634,7 +670,8 @@ void winco_yield() {
     WINCO_ROUTINE* rt = g_thrd->active_rt;
     winco_q_pushback(&th->ready_q, &rt->state_node);
 
-    InterlockedIncrement64(&th->w->metric->sleep_n);
+    ILINC64(&th->w->metric->yield_n);
+    ILINC64(&th->w->metric->ctx_s_yl_n);
 
     SwitchToFiber(th->sched_rt);
 }
@@ -652,7 +689,8 @@ void winco_sleep(uint64_t ms) {
     rt->tmout = winco_tick_ms() + ms;
     winco_q_pushback(&th->wait_q, &rt->state_node);
 
-    InterlockedIncrement64(&th->w->metric->sleep_n);
+    ILINC64(&th->w->metric->sleep_n);
+    ILINC64(&th->w->metric->ctx_s_sl_n);
 
     SwitchToFiber(th->sched_rt);
 }
@@ -702,7 +740,9 @@ void winco_lock0(WINCO_LOCK *lk, int mode) {
             }
             // Coroutine. Go idle & wait for wakeup.
             else {
-                InterlockedIncrement64(&g_thrd->w->metric->lock_fail_n);
+                ILINC64(&g_thrd->w->metric->lock_block_n);
+                ILINC64(&g_thrd->w->metric->ctx_s_lk_n);
+                ILINC64(&g_thrd->w->metric->lock_q);
 
                 WINCO_THRD* th = g_thrd;
                 WINCO_ROUTINE* rt = th->active_rt;
@@ -712,13 +752,15 @@ void winco_lock0(WINCO_LOCK *lk, int mode) {
                 LeaveCriticalSection(&lk->lk);
                 SwitchToFiber(g_thrd->sched_rt);
                 EnterCriticalSection(&lk->lk);
+
+                ILDEC64(&g_thrd->w->metric->lock_q);
             }
         }
     }
     LeaveCriticalSection(&lk->lk);
 
     if (g_thrd) {
-        InterlockedIncrement64(&g_thrd->w->metric->lock_n);
+        ILINC64(&g_thrd->w->metric->lock_n);
     }
 }
 
@@ -764,7 +806,7 @@ void winco_unlock(WINCO_LOCK* lk) {
     LeaveCriticalSection(&lk->lk);
 
     if (g_thrd) {
-        InterlockedIncrement64(&g_thrd->w->metric->unlock_n);
+        ILINC64(&g_thrd->w->metric->unlock_n);
     }
 }
 
@@ -792,13 +834,13 @@ int winco_cond_wait(WINCO_COND_VAR* cond, WINCO_LOCK* lk, uint64_t wait_ms) {
     WINCO_THRD* th = g_thrd;
 
     if (th) {
-        InterlockedIncrement64(&th->w->metric->cond_w_n);
+        ILINC64(&th->w->metric->cond_w_n);
     }
 
     // Coroutine. Wait in wait q with tmout + wait in awake q.
     if (th) {
         WINCO_ROUTINE* rt = th->active_rt;
-        InterlockedExchange64(&rt->tmout, winco_tick_ms() + wait_ms);
+        ILEXC64(&rt->tmout, winco_tick_ms() + wait_ms);
         rt->condvar = cond;
         rt->condvar_err = 0;
         winco_q_pushback(&th->wait_q, &rt->state_node);
@@ -807,9 +849,14 @@ int winco_cond_wait(WINCO_COND_VAR* cond, WINCO_LOCK* lk, uint64_t wait_ms) {
         winco_q_pushback(&cond->awake_q, &rt->awake_node);
         LeaveCriticalSection(&cond->lk);
 
+        ILINC64(&th->w->metric->ctx_s_cw_n);
+        ILINC64(&g_thrd->w->metric->cndw_q);
+
         winco_unlock(lk);
         SwitchToFiber(th->sched_rt);
         winco_lock(lk);
+
+        ILDEC64(&g_thrd->w->metric->cndw_q);
         r = rt->condvar_err;
     }
     // Thread. Wait on cond var.
@@ -827,10 +874,10 @@ int winco_cond_wait(WINCO_COND_VAR* cond, WINCO_LOCK* lk, uint64_t wait_ms) {
 
     if (th) {
         if (r == 0) {
-            InterlockedIncrement64(&th->w->metric->cond_sd_n);
+            ILINC64(&th->w->metric->cond_wk_n);
         }
         else {
-            InterlockedIncrement64(&th->w->metric->cond_to_n);
+            ILINC64(&th->w->metric->cond_to_n);
         }
     }
 
@@ -855,7 +902,7 @@ void winco_cond_signal(WINCO_COND_VAR* cond) {
         // To awake q & signal.
         WINCO_THRD* th = rt->thrd;
         // Wakeup & tmout may both happen, CAS tmout->0 to elect owner.
-        uint64_t tmout = InterlockedExchangeAdd64(&rt->tmout, 0);
+        uint64_t tmout = ILGET64(&rt->tmout);
         if (InterlockedCompareExchange64(&rt->tmout, 0, tmout) == tmout) {
             rt->condvar = NULL;
             EnterCriticalSection(&th->awake_q_l);
@@ -866,7 +913,7 @@ void winco_cond_signal(WINCO_COND_VAR* cond) {
     }
 
     if (g_thrd) {
-        InterlockedIncrement64(&g_thrd->w->metric->cond_s_n);
+        ILINC64(&g_thrd->w->metric->cond_s_n);
     }
 }
 
@@ -891,7 +938,7 @@ void winco_cond_signal_all(WINCO_COND_VAR* cond) {
         // To awake q & signal.
         WINCO_THRD* th = rt->thrd;
         // Wakeup & tmout may both happen, CAS tmout->0 to elect owner.
-        uint64_t tmout = InterlockedExchangeAdd64(&rt->tmout, 0);
+        uint64_t tmout = ILGET64(&rt->tmout);
         if (InterlockedCompareExchange64(&rt->tmout, 0, tmout) == tmout) {
             rt->condvar = NULL;
             EnterCriticalSection(&th->awake_q_l);
@@ -902,7 +949,7 @@ void winco_cond_signal_all(WINCO_COND_VAR* cond) {
     }
 
     if (g_thrd) {
-        InterlockedIncrement64(&g_thrd->w->metric->cond_s_n);
+        ILINC64(&g_thrd->w->metric->cond_s_n);
     }
 }
 
@@ -916,7 +963,8 @@ int winco_wsapoll(LPWSAPOLLFD fdArray, ULONG fds, INT timeout) {
         return WSAPoll(fdArray, fds, timeout);
     }
     
-    InterlockedIncrement64(&th->w->metric->wsapoll_n);
+    ILINC64(&th->w->metric->wsapoll_n);
+    ILINC64(&th->w->metric->ctx_s_pl_n);
 
     WINCO_ROUTINE* rt = th->active_rt;
     assert(rt);
@@ -929,10 +977,10 @@ int winco_wsapoll(LPWSAPOLLFD fdArray, ULONG fds, INT timeout) {
     SwitchToFiber(th->sched_rt);
 
     if (rt->wsapoll_err > 0) {
-        InterlockedIncrement64(&th->w->metric->wsapoll_succ_n);
+        ILINC64(&th->w->metric->wsapoll_event_n);
     }
     else {
-        InterlockedIncrement64(&th->w->metric->wsapoll_to_n);
+        ILINC64(&th->w->metric->wsapoll_to_n);
     }
 
     return rt->wsapoll_err;
@@ -961,81 +1009,124 @@ int winco_rt_routine_id(WINCO_ROUTINE* rt) {
 /* Stats. */
 WINCO_STATS winco_stats(WINCO* w) {
     METRIC mt;
-    mt.thread_n = InterlockedExchangeAdd64(&w->metric->thread_n, 0);
-    mt.coroutine_n = InterlockedExchangeAdd64(&w->metric->coroutine_n, 0);
-    mt.ctx_switch_n = InterlockedExchange64(&w->metric->ctx_switch_n, 0);
-    mt.proc_time_us = InterlockedExchange64(&w->metric->proc_time_us, 0);
-    mt.idle_time_us = InterlockedExchange64(&w->metric->idle_time_us, 0);
-    mt.sleep_n = InterlockedExchange64(&w->metric->sleep_n, 0);
-    mt.yield_n = InterlockedExchange64(&w->metric->yield_n, 0);
-    mt.lock_n = InterlockedExchange64(&w->metric->lock_n, 0);
-    mt.lock_fail_n = InterlockedExchange64(&w->metric->lock_fail_n, 0);
-    mt.unlock_n = InterlockedExchange64(&w->metric->unlock_n, 0);
-    mt.cond_w_n = InterlockedExchange64(&w->metric->cond_w_n, 0);
-    mt.cond_s_n = InterlockedExchange64(&w->metric->cond_s_n, 0);
-    mt.cond_sd_n = InterlockedExchange64(&w->metric->cond_sd_n, 0);
-    mt.cond_to_n = InterlockedExchange64(&w->metric->cond_to_n, 0);
-    mt.wsapoll_n = InterlockedExchange64(&w->metric->wsapoll_n, 0);
-    mt.wsapoll_succ_n = InterlockedExchange64(&w->metric->wsapoll_succ_n, 0);
-    mt.wsapoll_to_n = InterlockedExchange64(&w->metric->wsapoll_to_n, 0);
-    mt.wsapoll_cost_us = InterlockedExchange64(&w->metric->wsapoll_cost_us, 0);
+    mt.thrd_n = ILGET64(&w->metric->thrd_n);
+    mt.cort_n = ILGET64(&w->metric->cort_n);
+    mt.ctx_s_n = ILEXC64(&w->metric->ctx_s_n, 0);
+    mt.ctx_s_yl_n = ILEXC64(&w->metric->ctx_s_yl_n, 0);
+    mt.ctx_s_sl_n = ILEXC64(&w->metric->ctx_s_sl_n, 0);
+    mt.ctx_s_lk_n = ILEXC64(&w->metric->ctx_s_lk_n, 0);
+    mt.ctx_s_cw_n = ILEXC64(&w->metric->ctx_s_cw_n, 0);
+    mt.ctx_s_pl_n = ILEXC64(&w->metric->ctx_s_pl_n, 0);
+    mt.exec_t = ILEXC64(&w->metric->exec_t, 0);
+    mt.idle_t = ILEXC64(&w->metric->idle_t, 0);
+    mt.poll_t = ILEXC64(&w->metric->poll_t, 0);
+    mt.wake_t = ILEXC64(&w->metric->wake_t, 0);
+    mt.wscn_t = ILEXC64(&w->metric->wscn_t, 0);
+    mt.lock_q = ILGET64(&w->metric->lock_q);
+    mt.cndw_q = ILGET64(&w->metric->cndw_q);
+    mt.wake_q = ILEXC64(&w->metric->wake_q, 0);
+    mt.wake_q_spn = ILEXC64(&w->metric->wake_q_spn, 0);
+    mt.wait_q = ILEXC64(&w->metric->wait_q, 0);
+    mt.wait_q_spn = ILEXC64(&w->metric->wait_q_spn, 0);
+    mt.wsapoll_q = ILEXC64(&w->metric->wsapoll_q, 0);
+    mt.wsapoll_q_spn = ILEXC64(&w->metric->wsapoll_q_spn, 0);
+    mt.sleep_n = ILEXC64(&w->metric->sleep_n, 0);
+    mt.yield_n = ILEXC64(&w->metric->yield_n, 0);
+    mt.lock_n = ILEXC64(&w->metric->lock_n, 0);
+    mt.lock_block_n = ILEXC64(&w->metric->lock_block_n, 0);
+    mt.unlock_n = ILEXC64(&w->metric->unlock_n, 0);
+    mt.cond_w_n = ILEXC64(&w->metric->cond_w_n, 0);
+    mt.cond_s_n = ILEXC64(&w->metric->cond_s_n, 0);
+    mt.cond_wk_n = ILEXC64(&w->metric->cond_wk_n, 0);
+    mt.cond_to_n = ILEXC64(&w->metric->cond_to_n, 0);
+    mt.wsapoll_n = ILEXC64(&w->metric->wsapoll_n, 0);
+    mt.wsapoll_event_n = ILEXC64(&w->metric->wsapoll_event_n, 0);
+    mt.wsapoll_to_n = ILEXC64(&w->metric->wsapoll_to_n, 0);
 
     uint64_t now = winco_tick_ms();
     double t_ms = (double)(now - w->last_stat);
     w->last_stat = now;
 
     WINCO_STATS st;
-    st.thread_n = mt.thread_n;
-    st.coroutine_n = mt.coroutine_n;
-    st.ctx_switch_per_sec = ((double)mt.ctx_switch_n * 1000) / t_ms;
-    st.proc_t_ms_per_sec = ((double)mt.proc_time_us) / t_ms;
-    st.idle_t_ms_per_sec = ((double)mt.idle_time_us) / t_ms;
-    st.sleep_per_sec = ((double)mt.sleep_n * 1000) / t_ms;
-    st.yield_per_sec = ((double)mt.yield_n * 1000) / t_ms;
-    st.lock_per_sec = ((double)mt.lock_n * 1000) / t_ms;
-    st.lock_fail_per_sec = ((double)mt.lock_fail_n * 1000) / t_ms;
-    st.unlock_per_sec = ((double)mt.unlock_n * 1000) / t_ms;
-    st.cond_wait_per_sec = ((double)mt.cond_w_n * 1000) / t_ms;
-    st.cond_signal_per_sec = ((double)mt.cond_s_n * 1000) / t_ms;
-    st.cond_signaled_per_sec = ((double)mt.cond_sd_n * 1000) / t_ms;
-    st.cond_tmdout_per_sec = ((double)mt.cond_to_n * 1000) / t_ms;
-    st.wsapoll_per_sec = ((double)mt.wsapoll_n * 1000) / t_ms;
-    st.wsapoll_succ_per_sec = ((double)mt.wsapoll_succ_n * 1000) / t_ms;
-    st.wsapoll_tmdout_per_sec = ((double)mt.wsapoll_to_n * 1000) / t_ms;
-    st.wsapoll_cost_per_sec = ((double)mt.wsapoll_cost_us) / t_ms;
+    st.thread_n = (double)mt.thrd_n;
+    st.coroutine_n = (double)mt.cort_n;
+#define __COPY(m, n) st.m = (double)mt.n
+#define __COPY_AVG(m, n, k) st.m = ((double)mt.n / (double)mt.k)
+#define __COPY_MS(m, n) st.m = ((double)mt.n * 1000) / t_ms
+#define __COPY_US2MS(m) st.m= ((double)mt.m) / t_ms
+    __COPY_MS(ctx_s, ctx_s_n);
+    __COPY_MS(ctx_s_yield, ctx_s_yl_n);
+    __COPY_MS(ctx_s_sleep, ctx_s_sl_n);
+    __COPY_MS(ctx_s_lock, ctx_s_lk_n);
+    __COPY_MS(ctx_s_cndw, ctx_s_cw_n);
+    __COPY_MS(ctx_s_poll, ctx_s_pl_n);
+    __COPY_US2MS(exec_t);
+    __COPY_US2MS(idle_t);
+    __COPY_US2MS(poll_t);
+    __COPY_US2MS(wake_t);
+    __COPY_US2MS(wscn_t);
+    __COPY(lock_q_len, lock_q);
+    __COPY(cndw_q_len, cndw_q);
+    __COPY_AVG(wake_q_len, wake_q, wake_q_spn);
+    __COPY_AVG(wait_q_len, wait_q, wait_q_spn);
+    __COPY_AVG(poll_q_len, wsapoll_q, wsapoll_q_spn);
+    __COPY_MS(yield, yield_n);
+    __COPY_MS(sleep, sleep_n);
+    __COPY_MS(lock, lock_n);
+    __COPY_MS(lblk, lock_block_n);
+    __COPY_MS(unlk, unlock_n);
+    __COPY_MS(cndw, cond_w_n);
+    __COPY_MS(cndw_sig, cond_s_n);
+    __COPY_MS(cndw_tmout, cond_to_n);
+    __COPY_MS(cndw_wake, cond_wk_n);
+    __COPY_MS(poll, wsapoll_n);
+    __COPY_MS(poll_event, wsapoll_event_n);
+    __COPY_MS(poll_tmout, wsapoll_to_n);
 
     return st;
 }
 
 void winco_stats_str(WINCO_STATS st, char* buf, int buf_len) {
     assert(buf);
-    assert(buf_len > 256);
-    snprintf(buf, buf_len,
-        "thrd_n/cort_n\t\t%"PRId64"/%"PRId64"\n"
-        "ctxs/proc/idle\t\t%.2f/%.2fms/%.2fms /sec\n"
-        "yield/sleep\t\t%.2f/%.2f\n"
-        "lock/unlk/block\t\t%.2f/%.2f/%.2f /sec\n"
-        "cndw/sig/wake/tmout/s\t%.2f/%.2f/%.2f/%.2f /sec\n"
-        "poll/succ/tmout/cost\t%.2f/%.2f/%.2f/%.2fms /sec\n"
-        ,
+    assert(buf_len >= 512);
+    snprintf(buf, buf_len, 
+        "cfg:\tth=%.0f rt=%.0f\n"
+        "ctx_s:\tall=%.1f yl=%.1f sl=%.1f lk=%.1f cw=%.1f pl=%.1f (/s)\n"
+        "time:\texec=%.1f idle=%.1f poll=%.1f wake=%.1f wscn=%.1f (ms/s)\n"
+        "queue:\tlk=%.1f cw=%.1f wk=%.1f wt=%.1f pl=%.1f\n"
+        "ops:\tyl/sl=%.1f/%.1f lk/ul/bl=%.1f/%.1f/%.1f "
+        "cw/sg/wk/to=%.1f/%.1f/%.1f/%.1f pl/ev/to=%.1f/%.1f/%.1f (/s)\n",
         st.thread_n,
         st.coroutine_n,
-        st.ctx_switch_per_sec,
-        st.proc_t_ms_per_sec,
-        st.idle_t_ms_per_sec,
-        st.yield_per_sec,
-        st.sleep_per_sec,
-        st.lock_per_sec,
-        st.lock_fail_per_sec,
-        st.unlock_per_sec,
-        st.cond_wait_per_sec,
-        st.cond_signal_per_sec,
-        st.cond_signaled_per_sec,
-        st.cond_tmdout_per_sec,
-        st.wsapoll_per_sec,
-        st.wsapoll_succ_per_sec,
-        st.wsapoll_tmdout_per_sec,
-        st.wsapoll_cost_per_sec);
+        st.ctx_s,
+        st.ctx_s_yield,
+        st.ctx_s_sleep,
+        st.ctx_s_lock,
+        st.ctx_s_cndw,
+        st.ctx_s_poll,
+        st.exec_t,
+        st.idle_t,
+        st.poll_t,
+        st.wake_t,
+        st.wscn_t,
+        st.lock_q_len,
+        st.cndw_q_len,
+        st.wake_q_len,
+        st.wait_q_len,
+        st.poll_q_len,
+        st.yield,
+        st.sleep,
+        st.lock,
+        st.unlk,
+        st.lblk,
+        st.cndw,
+        st.cndw_sig,
+        st.cndw_wake,
+        st.cndw_tmout,
+        st.poll,
+        st.poll_event,
+        st.poll_tmout
+        );
 }
 
 
