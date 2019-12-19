@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Yijun Fu
+ * Copyright 2019 Yijun Fu <fuyijun1989@gmail.com>
  * 
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -79,17 +79,17 @@ void* yield_join_j(void* arg) {
 }
 
 void yield_join_t() {
-    winco_init();
-    WINCO_ROUTINE* rt1 = winco_create(yield_join_j, (void*)Million);
+    WINCO* w = winco_init(2);
+    WINCO_ROUTINE* rt1 = winco_create(w, yield_join_j, (void*)Million);
     int64_t r = (int64_t)winco_join(rt1);
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     EXP(2 * Million == r, PRT("r = %"PRId64, r));
     winco_delete(rt1);
-    winco_destroy();
+    winco_destroy(w);
 }
 
 
@@ -110,19 +110,19 @@ void sleep_t() {
     uint64_t r0 = (uint64_t)exex.fn_ret;
 
     // Winco sleep.
-    winco_init();
-    WINCO_ROUTINE* rt1 = winco_create(sleep_j, NULL);
+    WINCO* w = winco_init(2);
+    WINCO_ROUTINE* rt1 = winco_create(w, sleep_j, NULL);
     int64_t r1 = (int64_t)winco_join(rt1);
 
     PRTDBG("> 100 System sleep(1) %"PRIu64" ms\n"
            "> 100 WinCo  sleep(1) %"PRIu64" ms\n", r0, r1);
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     winco_delete(rt1);
-    winco_destroy();
+    winco_destroy(w);
 }
 
 
@@ -150,16 +150,15 @@ void* lock_add_j(void* arg) {
 /* Lock 1, n coroutines in 1 thread. */
 void lock_n_cort_1_thrd() {
     // Only a few ctx switches should happen.
-    winco_cfg(WINCO_CFG_THRD_CNT, 1);
-    winco_init();
+    WINCO* w = winco_init(1);
     LOCK_TD d;
     d.value = 0;
     d.lock = winco_lock_init();
     d.target = 1 * Million;
     d.to_yield = 0;
-    WINCO_ROUTINE* rt1 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt2 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt3 = winco_create(lock_add_j, &d);
+    WINCO_ROUTINE* rt1 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt2 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt3 = winco_create(w, lock_add_j, &d);
     winco_join(rt1);
     winco_join(rt2);
     winco_join(rt3);
@@ -168,29 +167,28 @@ void lock_n_cort_1_thrd() {
     EXP(3 * Million == d.value, PRT("val = %"PRId64, d.value));
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     winco_delete(rt1);
     winco_delete(rt2);
     winco_delete(rt3);
-    winco_destroy();
+    winco_destroy(w);
 }
 
 /* Lock 2, n coroutines in 2 thread. */
 void lock_n_cort_2_thrd() {
     // Much more ctx switches happen.
-    winco_cfg(WINCO_CFG_THRD_CNT, 2);
-    winco_init();
+    WINCO* w = winco_init(2);
     LOCK_TD d;
     d.value = 0;
     d.lock = winco_lock_init();
     d.target = 1 * Million;
     d.to_yield = 0;
-    WINCO_ROUTINE* rt1 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt2 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt3 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt4 = winco_create(lock_add_j, &d);
+    WINCO_ROUTINE* rt1 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt2 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt3 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt4 = winco_create(w, lock_add_j, &d);
     winco_join(rt1);
     winco_join(rt2);
     winco_join(rt3);
@@ -200,30 +198,29 @@ void lock_n_cort_2_thrd() {
     EXP(4 * Million == d.value, PRT("val = %"PRId64, d.value));
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     winco_delete(rt1);
     winco_delete(rt2);
     winco_delete(rt3);
     winco_delete(rt4);
-    winco_destroy();
+    winco_destroy(w);
 }
 
 /* Lock 3, n coroutines in 2 thread with yield. */
 void lock_n_cort_2_thrd_yield() {
     // Even more ctx switches happen.
-    winco_cfg(WINCO_CFG_THRD_CNT, 2);
-    winco_init();
+    WINCO* w = winco_init(2);
     LOCK_TD d;
     d.value = 0;
     d.lock = winco_lock_init();
     d.target = 1 * Million;
     d.to_yield = 1;
-    WINCO_ROUTINE* rt1 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt2 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt3 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt4 = winco_create(lock_add_j, &d);
+    WINCO_ROUTINE* rt1 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt2 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt3 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt4 = winco_create(w, lock_add_j, &d);
     winco_join(rt1);
     winco_join(rt2);
     winco_join(rt3);
@@ -233,20 +230,19 @@ void lock_n_cort_2_thrd_yield() {
     EXP(4 * Million == d.value, PRT("val = %"PRId64, d.value));
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     winco_delete(rt1);
     winco_delete(rt2);
     winco_delete(rt3);
     winco_delete(rt4);
-    winco_destroy();
+    winco_destroy(w);
 }
 
 /* Lock 4, threads mix with coroutines. */
 void lock_n_thrd_mix_cort() {
-    winco_cfg(WINCO_CFG_THRD_CNT, 2);
-    winco_init();
+    WINCO* w = winco_init(2);
     LOCK_TD d;
     d.value = 0;
     d.lock = winco_lock_init();
@@ -257,10 +253,10 @@ void lock_n_thrd_mix_cort() {
     exex.fn_arg = &d;
     HANDLE thrd1 = CreateThread(NULL, 0, exec_in_thrd, &exex, 0, NULL);
     HANDLE thrd2 = CreateThread(NULL, 0, exec_in_thrd, &exex, 0, NULL);
-    WINCO_ROUTINE* rt1 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt2 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt3 = winco_create(lock_add_j, &d);
-    WINCO_ROUTINE* rt4 = winco_create(lock_add_j, &d);
+    WINCO_ROUTINE* rt1 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt2 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt3 = winco_create(w, lock_add_j, &d);
+    WINCO_ROUTINE* rt4 = winco_create(w, lock_add_j, &d);
     WaitForSingleObject(thrd1, INFINITE);
     WaitForSingleObject(thrd2, INFINITE);
     winco_join(rt1);
@@ -272,7 +268,7 @@ void lock_n_thrd_mix_cort() {
     EXP(6 * Million == d.value, PRT("val = %"PRId64, d.value));
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     CloseHandle(thrd1);
@@ -281,7 +277,7 @@ void lock_n_thrd_mix_cort() {
     winco_delete(rt2);
     winco_delete(rt3);
     winco_delete(rt4);
-    winco_destroy();
+    winco_destroy(w);
 }
 
 
@@ -366,8 +362,7 @@ void* cond_consume_j(void* arg) {
 
 /* Cond 1, 2 cort in 1 thread. */
 void cond_2_cort_1_thrd() {
-    winco_cfg(WINCO_CFG_THRD_CNT, 1);
-    winco_init();
+    WINCO* w = winco_init(1);
     COND_ADD d;
     d.target = 1 * Hundred;
     d.val = 0;
@@ -375,9 +370,9 @@ void cond_2_cort_1_thrd() {
     d.lock = winco_lock_init();
     d.condvar = winco_cond_init();
     d.check_wait_ret = 1;
-    WINCO_ROUTINE* prod = winco_create(cond_produce_j, (void*)&d);
+    WINCO_ROUTINE* prod = winco_create(w, cond_produce_j, (void*)&d);
     winco_sleep(100);
-    WINCO_ROUTINE* cons = winco_create(cond_consume_j, (void*)&d);
+    WINCO_ROUTINE* cons = winco_create(w, cond_consume_j, (void*)&d);
     winco_join(prod);
     int64_t sum = (int64_t)winco_join(cons);
     EXP(1 * Hundred == sum, PRT("sum = %"PRId64, sum));
@@ -385,18 +380,17 @@ void cond_2_cort_1_thrd() {
     winco_cond_destroy(d.condvar);
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     winco_delete(prod);
     winco_delete(cons);
-    winco_destroy();
+    winco_destroy(w);
 }
 
 /* Cond 2, 2 cort in 2 threads. */
 void cond_2_cort_2_thrd() {
-    winco_cfg(WINCO_CFG_THRD_CNT, 2);
-    winco_init();
+    WINCO* w = winco_init(2);
     COND_ADD d;
     d.target = 1 * Hundred;
     d.val = 0;
@@ -404,28 +398,27 @@ void cond_2_cort_2_thrd() {
     d.lock = winco_lock_init();
     d.condvar = winco_cond_init();
     d.check_wait_ret = 1;
-    WINCO_ROUTINE* prod = winco_create(cond_produce_j, (void*)&d);
+    WINCO_ROUTINE* prod = winco_create(w, cond_produce_j, (void*)&d);
     winco_sleep(100);
-    WINCO_ROUTINE* cons = winco_create(cond_consume_j, (void*)&d);
+    WINCO_ROUTINE* cons = winco_create(w, cond_consume_j, (void*)&d);
     winco_join(prod);
     int64_t sum = (int64_t)winco_join(cons);
     EXP(1 * Hundred == sum, PRT("sum = %"PRId64, sum));
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     winco_lock_destroy(d.lock);
     winco_cond_destroy(d.condvar);
     winco_delete(prod);
     winco_delete(cons);
-    winco_destroy();
+    winco_destroy(w);
 }
 
 /* Cond 3, cort to thread. */
 void cond_cort_to_thrd() {
-    winco_cfg(WINCO_CFG_THRD_CNT, 1);
-    winco_init();
+    WINCO* w = winco_init(2);
     COND_ADD d;
     d.target = 1 * Hundred;
     d.val = 0;
@@ -436,7 +429,7 @@ void cond_cort_to_thrd() {
     THRD_EXEC_PARAM exex;
     exex.fn = cond_consume_j;
     exex.fn_arg = &d;
-    WINCO_ROUTINE* prod = winco_create(cond_produce_j, (void*)&d);
+    WINCO_ROUTINE* prod = winco_create(w, cond_produce_j, (void*)&d);
     winco_sleep(1000);
     HANDLE cons = CreateThread(NULL, 0, exec_in_thrd, &exex, 0, NULL);
     winco_join(prod);
@@ -445,20 +438,19 @@ void cond_cort_to_thrd() {
     EXP(1 * Hundred == sum, PRT("sum = %"PRId64, sum));
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     winco_lock_destroy(d.lock);
     winco_cond_destroy(d.condvar);
     winco_delete(prod);
     CloseHandle(cons);
-    winco_destroy();
+    winco_destroy(w);
 }
 
 /* Cond 4, thread to cort. */
 void cond_thrd_to_cort() {
-    winco_cfg(WINCO_CFG_THRD_CNT, 1);
-    winco_init();
+    WINCO* w = winco_init(2);
     COND_ADD d;
     d.target = 1 * Hundred;
     d.val = 0;
@@ -471,20 +463,20 @@ void cond_thrd_to_cort() {
     exex.fn_arg = &d;
     HANDLE prod = CreateThread(NULL, 0, exec_in_thrd, &exex, 0, NULL);
     winco_sleep(100);
-    WINCO_ROUTINE* cons = winco_create(cond_consume_j, (void*)&d);
+    WINCO_ROUTINE* cons = winco_create(w, cond_consume_j, (void*)&d);
     WaitForSingleObject(prod, INFINITE);
     int64_t sum = (int64_t)winco_join(cons);
     EXP(1 * Hundred == sum, PRT("sum = %"PRId64, sum));
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     winco_lock_destroy(d.lock);
     winco_cond_destroy(d.condvar);
     winco_delete(cons);
     CloseHandle(prod);
-    winco_destroy();
+    winco_destroy(w);
 }
 
 /* Poll. */
@@ -596,11 +588,10 @@ void poll_msg_send_tmout() {
     int64_t target = 5;
     int64_t sum = 0;
 
-    winco_cfg(WINCO_CFG_THRD_CNT, 2);
-    winco_init();
+    WINCO* w = winco_init(2);
     WINCO_ROUTINE** rts = (WINCO_ROUTINE**)calloc(jobn, sizeof(uint64_t));
     for (int p = 0; p < jobn; p++) { 
-        rts[p] = winco_create(poll_cons_j, (void*)(int64_t)recv_fds[p]);
+        rts[p] = winco_create(w, poll_cons_j, (void*)(int64_t)recv_fds[p]);
     }
 
     for (int t = 0; t < target; t++) {
@@ -622,11 +613,11 @@ void poll_msg_send_tmout() {
     }
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     free(rts);
-    winco_destroy();
+    winco_destroy(w);
 
     EXP(target * jobn == sum, PRT("sum = %"PRId64, sum));
 
@@ -652,12 +643,11 @@ void poll_msg_send_fast() {
     int64_t target = 1 * Kilo;
     int64_t sum = 0;
 
-    winco_cfg(WINCO_CFG_THRD_CNT, 2);
-    winco_init();
+    WINCO* w = winco_init(2);
 
     WINCO_ROUTINE** rts = (WINCO_ROUTINE**)calloc(jobn, sizeof(uint64_t));
     for (int p = 0; p < jobn; p++) { 
-        rts[p] = winco_create(poll_cons_j, (void*)(int64_t)recv_fds[p]);
+        rts[p] = winco_create(w, poll_cons_j, (void*)(int64_t)recv_fds[p]);
     }
     Sleep(500);
 
@@ -679,11 +669,11 @@ void poll_msg_send_fast() {
     }
 
     char str[512];
-    winco_stats_str(winco_stats(), str, 512);
+    winco_stats_str(winco_stats(w), str, 512);
     PRTDBG("stats:\n%s", str);
 
     free(rts);
-    winco_destroy();
+    winco_destroy(w);
 
     EXP(target * jobn == sum, PRT("sum = %"PRId64, sum));
 

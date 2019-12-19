@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 Yijun Fu
+ * Copyright 2019 Yijun Fu <fuyijun1989@gmail.com>
  * 
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,23 +33,25 @@
 #include <sysinfoapi.h>
 
 
-/* Init. Call at least once for a process. */
-int winco_init();
+typedef struct WINCO_T WINCO;
 
-/* Destroy.*/
-int winco_destroy();
+/* Init. Set 0 for core N. */
+WINCO* winco_init(int thrd_n);
 
-/* Launch new win coroutine. */
+/* Destroy. */
+void winco_destroy(WINCO* winco);
+
 typedef struct WINCO_ROUTINE_T WINCO_ROUTINE;
 typedef void* (*cort_fn)(void* arg);
-WINCO_ROUTINE* winco_create(cort_fn fn, void* arg);
+
+/* Launch new coroutine. */
+WINCO_ROUTINE* winco_create(WINCO* winco, cort_fn fn, void* arg);
+
+/* Join & destroy coroutine. */
 void* winco_join(WINCO_ROUTINE* rt);
 void winco_delete(WINCO_ROUTINE* rt);
 
-/* Yield. Ask scheduler to run other coroutines.
- * Important: in cooperative multitasking, without yield, sleep, cond wait,
- * or poll, other tasks may be blocked; call yield() to solve this problem.
- */
+/* Yield. */
 void winco_yield();
 
 /* Sleep. Apply to both thread & coroutine. */
@@ -86,31 +88,54 @@ int winco_rt_routine_id(WINCO_ROUTINE* rt);
 
 /* Stats. */
 typedef struct WINCO_STATS_T {
-    int64_t thread_n;
-    int64_t coroutine_n;
-    double ctx_switch_per_sec;
-    double proc_t_ms_per_sec;
-    double sleep_per_sec;
-    double lock_per_sec;
-    double unlock_per_sec;
-    double cond_wait_per_sec;
-    double cond_signal_per_sec;
-    double cond_tmdout_per_sec;
-    double cond_signaled_per_sec;
-    double wsapoll_per_sec;
-    double wsapoll_succ_per_sec;
-    double wsapoll_tmdout_per_sec;
+    double thread_n;
+    double coroutine_n;
+
+    /* Context switch per sec. */
+    double ctx_s;
+    double ctx_s_yield;
+    double ctx_s_sleep;
+    double ctx_s_lock;
+    double ctx_s_cndw;
+    double ctx_s_poll;
+
+    /* Thread exec time in ms per clock sec. */
+    double exec_t;
+    double idle_t;
+    double poll_t;
+    double wake_t;
+    double wscn_t;
+
+    /* Inner queue length. */
+    double lock_q_len;
+    double cndw_q_len;
+    double wake_q_len;
+    double wait_q_len;
+    double poll_q_len;
+
+    /* Ops per sec. */
+    double sleep;
+    double yield;
+    double lock;
+    double lblk;
+    double unlk;
+    double cndw;
+    double cndw_sig;
+    double cndw_tmout;
+    double cndw_wake;
+    double poll;
+    double poll_event;
+    double poll_tmout;
 } WINCO_STATS;
 
 /* Get stats since last call. */
-WINCO_STATS winco_stats();
+WINCO_STATS winco_stats(WINCO* w);
 void winco_stats_str(WINCO_STATS st, char* buf, int buf_len);
 
 /* Config. */
-int winco_cfg(char cfg, int val);
+int winco_cfg(WINCO* w, char cfg, int val);
 #define WINCO_CFG_THRD_IDLE 'A'
 #define WINCO_CFG_WSAPOLL_INTERV 'B'
 #define WINCO_CFG_COROUTINE_IDLE_TMOUT 'C'
-#define WINCO_CFG_THRD_CNT 'D'
 
 #endif // LIBWINCO
