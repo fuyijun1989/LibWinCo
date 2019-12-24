@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#ifdef _MSC_VER
 
 #include <stdlib.h>
 #include <ctype.h>
@@ -1149,4 +1150,4 @@ int winco_cfg(WINCO* w, char cfg, int val) {
     return 0;
 }
 
-
+#endif

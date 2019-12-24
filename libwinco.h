@@ -18,6 +18,8 @@
  * LibWinCo: a compact Win32 Coroutine Library.
  */
 
+#ifdef _MSC_VER
+
 #ifndef LIBWINCO
 #define LIBWINCO
 
@@ -139,3 +141,5 @@ int winco_cfg(WINCO* w, char cfg, int val);
 #define WINCO_CFG_COROUTINE_IDLE_TMOUT 'C'
 
 #endif // LIBWINCO
+
+#endif
